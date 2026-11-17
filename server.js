@@ -9,14 +9,39 @@ const fs = require('fs');
 
 const app = express();
 
-// PORT: starts at 3002 and automatically tries another port if busy.
-const START_PORT = Number(process.env.PORT) || 3002;
-const DATA_DIR = path.join(__dirname, 'data');
+// ==================================================
+// 1. SERVER AND STORAGE CONFIGURATION
+// ==================================================
+
+const PORT = Number(process.env.PORT) || 3002;
+
+const IS_PRODUCTION =
+    process.env.RENDER === 'true' ||
+    process.env.NODE_ENV === 'production';
+
+// Render persistent disk: /var/data
+// Local development: project/data
+
+const DATA_DIR = process.env.DATA_DIR ||
+    (IS_PRODUCTION
+        ? '/var/data'
+        : path.join(__dirname, 'data'));
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
+// Require a secure secret on production
+if (IS_PRODUCTION && !process.env.SESSION_SECRET) {
+    throw new Error(
+        'SESSION_SECRET environment variable is required.'
+    );
+}
+
 const SECRET = process.env.SESSION_SECRET ||
     'campus-event-hub-development-secret-change-before-deployment';
+
+// ==================================================
+// 2. SQLITE DATABASE
+// ==================================================
 
 const db = new Database(
     path.join(DATA_DIR, 'campus-events.sqlite')
@@ -24,6 +49,10 @@ const db = new Database(
 
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+
+// ==================================================
+// 3. DATABASE TABLES
+// ==================================================
 
 db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -56,15 +85,16 @@ db.exec(`
     );
 `);
 
-// --------------------------------------------------
-// SAMPLE EVENTS
-// --------------------------------------------------
+// ==================================================
+// 4. SAMPLE EVENTS
+// ==================================================
 
 const eventCount = db.prepare(
     'SELECT COUNT(*) AS total FROM events'
 ).get().total;
 
 if (eventCount === 0) {
+
     const insertEvent = db.prepare(`
         INSERT INTO events
         (title, category, date, time, venue,
@@ -122,37 +152,48 @@ if (eventCount === 0) {
     insertMany(sampleEvents);
 }
 
-// --------------------------------------------------
-// MIDDLEWARE
-// --------------------------------------------------
+// ==================================================
+// 5. MIDDLEWARE
+// ==================================================
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false }));
 
+// Trust Render proxy for secure cookies
+if (IS_PRODUCTION) {
+    app.set('trust proxy', 1);
+}
+
+// Persistent SQLite session storage
 app.use(session({
     store: new SQLiteStore({
         db: 'sessions.sqlite',
         dir: DATA_DIR
     }),
+
     secret: SECRET,
     resave: false,
     saveUninitialized: false,
+
     cookie: {
         httpOnly: true,
         sameSite: 'lax',
-        secure: process.env.NODE_ENV === 'production',
+        secure: IS_PRODUCTION,
         maxAge: 7 * 24 * 60 * 60 * 1000
     }
 }));
 
+// Serve frontend files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// --------------------------------------------------
-// HELPER FUNCTIONS
-// --------------------------------------------------
+// ==================================================
+// 6. HELPER FUNCTIONS
+// ==================================================
 
 const hashToken = token =>
-    crypto.createHash('sha256').update(token).digest('hex');
+    crypto.createHash('sha256')
+        .update(token)
+        .digest('hex');
 
 const createTicketToken = registration => {
     return crypto.createHmac('sha256', SECRET)
@@ -160,45 +201,69 @@ const createTicketToken = registration => {
         .digest('base64url');
 };
 
+// Student authentication
 function auth(req, res, next) {
+
     if (!req.session.user) {
         return res.status(401).json({
             error: 'Please sign in first.'
         });
     }
+
     next();
 }
 
+// Organizer authentication
 function organizer(req, res, next) {
+
     if (req.session.user?.role !== 'organizer') {
         return res.status(403).json({
             error: 'Organizer access required.'
         });
     }
+
     next();
 }
 
-// --------------------------------------------------
-// CURRENT USER
-// --------------------------------------------------
+// ==================================================
+// 7. HEALTH CHECK
+// ==================================================
 
-app.get('/api/me', (req, res) => {
+app.get('/health', (req, res) => {
     res.json({
-        user: req.session.user || null
+        status: 'OK',
+        application: 'Campus Event Hub'
     });
 });
 
-// --------------------------------------------------
-// SIGN UP
-// --------------------------------------------------
+// ==================================================
+// 8. CURRENT USER
+// ==================================================
+
+app.get('/api/me', (req, res) => {
+
+    res.json({
+        user: req.session.user || null
+    });
+
+});
+
+// ==================================================
+// 9. SIGN UP
+// ==================================================
 
 app.post('/api/signup', (req, res, next) => {
+
     try {
+
         const name = String(req.body.name || '')
-            .trim().slice(0, 80);
+            .trim()
+            .slice(0, 80);
 
         const email = String(req.body.email || '')
-            .trim().toLowerCase().slice(0, 160);
+            .trim()
+            .toLowerCase()
+            .slice(0, 160);
 
         if (
             name.length < 2 ||
@@ -231,30 +296,39 @@ app.post('/api/signup', (req, res, next) => {
         };
 
         req.session.save(err => {
+
             if (err) return next(err);
+
             res.status(201).json({
                 user: req.session.user
             });
+
         });
 
     } catch (error) {
+
         if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
             return res.status(409).json({
                 error: 'Email already registered. Please sign in.'
             });
         }
+
         next(error);
     }
+
 });
 
-// --------------------------------------------------
-// LOGIN
-// --------------------------------------------------
+// ==================================================
+// 10. LOGIN
+// ==================================================
 
 app.post('/api/login', (req, res, next) => {
+
     try {
+
         const email = String(req.body.email || '')
-            .trim().toLowerCase();
+            .trim()
+            .toLowerCase();
 
         const user = db.prepare(`
             SELECT id, name, email, role
@@ -271,34 +345,45 @@ app.post('/api/login', (req, res, next) => {
         req.session.user = user;
 
         req.session.save(err => {
+
             if (err) return next(err);
+
             res.json({ user });
+
         });
 
     } catch (error) {
         next(error);
     }
+
 });
 
-// --------------------------------------------------
-// LOGOUT
-// --------------------------------------------------
+// ==================================================
+// 11. LOGOUT
+// ==================================================
 
 app.post('/api/logout', (req, res, next) => {
+
     req.session.destroy(err => {
+
         if (err) return next(err);
 
         res.clearCookie('connect.sid');
+
         res.json({ ok: true });
+
     });
+
 });
 
-// --------------------------------------------------
-// GET ALL EVENTS
-// --------------------------------------------------
+// ==================================================
+// 12. GET ALL EVENTS
+// ==================================================
 
 app.get('/api/events', (req, res, next) => {
+
     try {
+
         const rows = db.prepare(`
             SELECT
                 e.*,
@@ -317,6 +402,7 @@ app.get('/api/events', (req, res, next) => {
                 ) AS registered
 
             FROM events e
+
             ORDER BY e.date, e.time
         `).all(req.session.user?.id || 0);
 
@@ -325,14 +411,17 @@ app.get('/api/events', (req, res, next) => {
     } catch (error) {
         next(error);
     }
+
 });
 
-// --------------------------------------------------
-// CREATE EVENT
-// --------------------------------------------------
+// ==================================================
+// 13. CREATE EVENT
+// ==================================================
 
 app.post('/api/events', auth, organizer, (req, res, next) => {
+
     try {
+
         const {
             title,
             category,
@@ -348,15 +437,19 @@ app.post('/api/events', auth, organizer, (req, res, next) => {
                 .every(value =>
                     typeof value === 'string' && value.trim()
                 ) ||
+
             !Number.isInteger(Number(capacity)) ||
             Number(capacity) < 1 ||
             Number(capacity) > 100000 ||
+
             !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
             !/^\d{2}:\d{2}$/.test(time)
         ) {
+
             return res.status(400).json({
                 error: 'Please complete all event fields correctly.'
             });
+
         }
 
         db.prepare(`
@@ -383,14 +476,17 @@ app.post('/api/events', auth, organizer, (req, res, next) => {
     } catch (error) {
         next(error);
     }
+
 });
 
-// --------------------------------------------------
-// REGISTER FOR EVENT
-// --------------------------------------------------
+// ==================================================
+// 14. REGISTER FOR EVENT
+// ==================================================
 
 app.post('/api/events/:id/register', auth, (req, res, next) => {
+
     try {
+
         const eventId = Number(req.params.id);
 
         if (!Number.isInteger(eventId) || eventId < 1) {
@@ -400,6 +496,7 @@ app.post('/api/events/:id/register', auth, (req, res, next) => {
         }
 
         const register = db.transaction(() => {
+
             const event = db.prepare(
                 'SELECT * FROM events WHERE id = ?'
             ).get(eventId);
@@ -427,7 +524,8 @@ app.post('/api/events/:id/register', auth, (req, res, next) => {
                 throw new Error('EVENT_FULL');
             }
 
-            const token = crypto.randomBytes(32).toString('base64url');
+            const token = crypto.randomBytes(32)
+                .toString('base64url');
 
             db.prepare(`
                 INSERT INTO registrations
@@ -440,6 +538,7 @@ app.post('/api/events/:id/register', auth, (req, res, next) => {
             );
 
             return true;
+
         });
 
         register();
@@ -450,6 +549,7 @@ app.post('/api/events/:id/register', auth, (req, res, next) => {
         });
 
     } catch (error) {
+
         const errors = {
             EVENT_NOT_FOUND: [404, 'Event not found.'],
             ALREADY_REGISTERED: [409, 'You are already registered.'],
@@ -457,38 +557,57 @@ app.post('/api/events/:id/register', auth, (req, res, next) => {
         };
 
         if (errors[error.message]) {
+
             const [status, message] = errors[error.message];
-            return res.status(status).json({ error: message });
+
+            return res.status(status).json({
+                error: message
+            });
+
         }
 
         next(error);
     }
+
 });
 
-// --------------------------------------------------
-// CANCEL REGISTRATION
-// --------------------------------------------------
+// ==================================================
+// 15. CANCEL REGISTRATION
+// ==================================================
 
 app.delete('/api/events/:id/register', auth, (req, res, next) => {
+
     try {
+
+        const eventId = Number(req.params.id);
+
+        if (!Number.isInteger(eventId) || eventId < 1) {
+            return res.status(400).json({
+                error: 'Invalid event ID.'
+            });
+        }
+
         db.prepare(`
             DELETE FROM registrations
             WHERE user_id = ? AND event_id = ?
-        `).run(req.session.user.id, Number(req.params.id));
+        `).run(req.session.user.id, eventId);
 
         res.json({ ok: true });
 
     } catch (error) {
         next(error);
     }
+
 });
 
-// --------------------------------------------------
-// MY TICKETS
-// --------------------------------------------------
+// ==================================================
+// 16. MY TICKETS AND QR GENERATION
+// ==================================================
 
 app.get('/api/my-tickets', auth, async (req, res) => {
+
     try {
+
         const rows = db.prepare(`
             SELECT
                 r.id,
@@ -511,7 +630,9 @@ app.get('/api/my-tickets', auth, async (req, res) => {
         `).all(req.session.user.id);
 
         const tickets = await Promise.all(
+
             rows.map(async registration => {
+
                 const token = createTicketToken(registration);
 
                 const qr = await QRCode.toDataURL(
@@ -531,26 +652,33 @@ app.get('/api/my-tickets', auth, async (req, res) => {
                     token: `CEH:${token}`,
                     qr
                 };
+
             })
+
         );
 
         res.json(tickets);
 
     } catch (error) {
+
         console.error('Ticket error:', error);
 
         res.status(500).json({
             error: 'Unable to load tickets.'
         });
+
     }
+
 });
 
-// --------------------------------------------------
-// ORGANIZER CHECK-IN
-// --------------------------------------------------
+// ==================================================
+// 17. ORGANIZER QR CHECK-IN
+// ==================================================
 
 app.post('/api/checkin', auth, organizer, (req, res, next) => {
+
     try {
+
         const token = String(req.body.token || '').trim();
 
         if (!token.startsWith('CEH:')) {
@@ -577,6 +705,7 @@ app.post('/api/checkin', auth, organizer, (req, res, next) => {
         `).all();
 
         const ticket = rows.find(row => {
+
             const expected = createTicketToken(row);
 
             const givenBytes = Buffer.from(candidate);
@@ -584,8 +713,12 @@ app.post('/api/checkin', auth, organizer, (req, res, next) => {
 
             return (
                 givenBytes.length === expectedBytes.length &&
-                crypto.timingSafeEqual(givenBytes, expectedBytes)
+                crypto.timingSafeEqual(
+                    givenBytes,
+                    expectedBytes
+                )
             );
+
         });
 
         if (!ticket) {
@@ -622,14 +755,17 @@ app.post('/api/checkin', auth, organizer, (req, res, next) => {
     } catch (error) {
         next(error);
     }
+
 });
 
-// --------------------------------------------------
-// ORGANIZER STATISTICS
-// --------------------------------------------------
+// ==================================================
+// 18. ORGANIZER STATISTICS
+// ==================================================
 
 app.get('/api/stats', auth, organizer, (req, res, next) => {
+
     try {
+
         const events = db.prepare(
             'SELECT COUNT(*) AS n FROM events'
         ).get().n;
@@ -653,13 +789,15 @@ app.get('/api/stats', auth, organizer, (req, res, next) => {
     } catch (error) {
         next(error);
     }
+
 });
 
-// --------------------------------------------------
-// WEBSITE FALLBACK
-// --------------------------------------------------
+// ==================================================
+// 19. WEBSITE FALLBACK
+// ==================================================
 
 app.use((req, res, next) => {
+
     if (req.method !== 'GET') {
         return res.status(404).json({
             error: 'API endpoint not found.'
@@ -672,13 +810,15 @@ app.use((req, res, next) => {
             if (error) next(error);
         }
     );
+
 });
 
-// --------------------------------------------------
-// ERROR HANDLER
-// --------------------------------------------------
+// ==================================================
+// 20. GLOBAL ERROR HANDLER
+// ==================================================
 
 app.use((error, req, res, next) => {
+
     console.error('Server error:', error);
 
     if (res.headersSent) {
@@ -688,32 +828,21 @@ app.use((error, req, res, next) => {
     res.status(500).json({
         error: 'Server error. Please try again.'
     });
+
 });
 
-// --------------------------------------------------
-// START SERVER WITH PORT FALLBACK
-// --------------------------------------------------
+// ==================================================
+// 21. START SERVER
+// ==================================================
 
-function startServer(port) {
-    const server = app.listen(port, '0.0.0.0');
+const server = app.listen(PORT, '0.0.0.0', () => {
 
-    server.on('listening', () => {
-        const address = server.address();
+    console.log('\n============================}');
+    console.log('Campus Event Hub Server');
+    console.log(`Listening on port ${PORT}`);
+    console.log(`Data directory: ${DATA_DIR}`);
+    console.log('============================\n');
 
-        console.log('\n================================');
-        console.log('Campus Event Hub started!');
-        console.log(`Website: http://localhost:${address.port}`);
-        console.log('================================\n');
-    });
+});
 
-    server.on('error', error => {
-        if (error.code === 'EADDRINUSE') {
-            console.log(`Port ${port} is busy. Trying ${port + 1}...`);
-            startServer(port + 1);
-        } else {
-            console.error('Server startup failed:', error);
-        }
-    });
-}
-
-startServer(START_PORT);
+module.exports = server;        
